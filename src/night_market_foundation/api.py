@@ -9,11 +9,19 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
+from .scheduling import SchedulingService
 from .service import DomainService
 from .storage import Database
 
 
-def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
+def _required(query: dict[str, list[str]], name: str) -> str:
+    value = query.get(name, [""])[0]
+    if not value:
+        raise ValidationError(f"{name} 不能为空")
+    return value
+
+
+def route(service: SchedulingService, method: str, path: str, body: dict[str, Any] | None,
           headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
     """把一个 HTTP 语义请求分派到领域服务。"""
 
@@ -48,6 +56,85 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+        # ---- 协同台账 ----
+        if method == "POST" and parsed.path == "/scheduling/participants":
+            receipt = service.register_participant(actor_id=actor_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+        if method == "POST" and parsed.path == "/scheduling/qualifications":
+            receipt = service.register_qualification(actor_id=actor_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+        if method == "POST" and parsed.path == "/scheduling/availability":
+            receipt = service.register_availability(actor_id=actor_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+        if method == "POST" and parsed.path == "/scheduling/zones":
+            receipt = service.register_zone(actor_id=actor_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+        if method == "POST" and parsed.path == "/scheduling/shifts":
+            receipt = service.create_shift(actor_id=actor_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+        if method == "POST" and parsed.path == "/scheduling/assignments":
+            receipt = service.create_assignment(actor_id=actor_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+        if method == "POST" and parsed.path == "/scheduling/replacement-plans":
+            receipt = service.generate_replacement_plan(actor_id=actor_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+        if method == "POST" and parsed.path == "/scheduling/plan-confirmations":
+            receipt = service.confirm_plan_option(actor_id=actor_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+        if method == "POST" and parsed.path == "/scheduling/checkins":
+            receipt = service.record_checkin(actor_id=actor_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+        if method == "POST" and parsed.path == "/scheduling/takeovers":
+            receipt = service.register_takeover(actor_id=actor_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+        if method == "POST" and parsed.path == "/scheduling/handover-completions":
+            receipt = service.complete_handover_item(actor_id=actor_id, **body)
+            return 200 if receipt.replayed else 201, receipt.__dict__
+        if method == "GET" and parsed.path == "/scheduling/shifts":
+            query = parse_qs(parsed.query)
+            return 200, service.get_shift(actor_id=actor_id, shift_id=_required(query, "shift_id"))
+        if method == "GET" and parsed.path == "/scheduling/shifts/revision":
+            query = parse_qs(parsed.query)
+            return 200, service.shift_revision(actor_id=actor_id,
+                                               shift_id=_required(query, "shift_id"),
+                                               version=int(_required(query, "version")))
+        if method == "GET" and parsed.path == "/scheduling/replacement-plans":
+            query = parse_qs(parsed.query)
+            plans = service.list_replacement_plans(actor_id=actor_id,
+                                                   plan_id=query.get("plan_id", [None])[0],
+                                                   shift_id=query.get("shift_id", [None])[0])
+            return 200, {"items": plans}
+        if method == "GET" and parsed.path == "/scheduling/checkins":
+            query = parse_qs(parsed.query)
+            return 200, {"items": service.list_checkins(actor_id=actor_id,
+                                                        shift_id=_required(query, "shift_id"))}
+        if method == "GET" and parsed.path == "/scheduling/zones/responsible":
+            query = parse_qs(parsed.query)
+            return 200, service.zone_responsible(actor_id=actor_id,
+                                                 zone_id=_required(query, "zone_id"),
+                                                 at=_required(query, "at"))
+        if method == "GET" and parsed.path == "/scheduling/shifts/uncovered-dependencies":
+            query = parse_qs(parsed.query)
+            return 200, service.uncovered_dependencies(actor_id=actor_id,
+                                                       shift_id=_required(query, "shift_id"))
+        if method == "GET" and parsed.path == "/scheduling/dispatch-logs":
+            query = parse_qs(parsed.query)
+            logs = service.dispatch_logs(actor_id=actor_id,
+                                         shift_id=query.get("shift_id", [None])[0],
+                                         result=query.get("result", [None])[0])
+            return 200, {"items": logs}
+        if method == "GET" and parsed.path == "/scheduling/takeovers":
+            query = parse_qs(parsed.query)
+            return 200, {"items": service.list_takeovers(actor_id=actor_id,
+                                                         shift_id=_required(query, "shift_id"))}
+        if method == "GET" and parsed.path == "/scheduling/handovers/pending":
+            return 200, {"items": service.pending_handovers(actor_id=actor_id)}
+        if method == "GET" and parsed.path == "/scheduling/participants":
+            query = parse_qs(parsed.query)
+            items = service.participants_view(actor_id=actor_id,
+                                              shift_id=_required(query, "shift_id"),
+                                              view=query.get("view", [None])[0])
+            return 200, {"items": items}
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
@@ -99,7 +186,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
     database = Database(args.database)
-    Handler.service = DomainService(database)
+    Handler.service = SchedulingService(database)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
